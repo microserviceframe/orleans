@@ -16,14 +16,13 @@ namespace Orleans.Serialization
     /// <summary>
     /// Writer for Orleans binary token streams
     /// </summary>
-    public sealed class BinaryTokenStreamWriter2<TBufferWriter> : IBinaryTokenStreamWriter where TBufferWriter : IBufferWriter<byte>
+    internal sealed class BinaryTokenStreamWriter2<TBufferWriter> : IBinaryTokenStreamWriter where TBufferWriter : IBufferWriter<byte>
     {
         private static readonly Dictionary<Type, SerializationTokenType> typeTokens;
         private static readonly Dictionary<Type, Action<BinaryTokenStreamWriter2<TBufferWriter>, object>> writers;
+        private static readonly Encoding Utf8Encoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false);
 
-#if SERIALIZER_SESSIONAWARE
-        private ReferencedTypeCollection referencedTypes;
-#endif
+        private readonly Encoder utf8Encoder = Utf8Encoding.GetEncoder();
         private TBufferWriter output;
         private Memory<byte> currentBuffer;
         private int currentOffset;
@@ -137,21 +136,63 @@ namespace Orleans.Serialization
         {
             this.Write(Decimal.GetBits(d));
         }
-        
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void Write(string s)
         {
-            if (null == s)
+            if (s is null)
             {
                 this.Write(-1);
             }
             else
             {
+#if NETCOREAPP
+                var enc = this.utf8Encoder;
+                enc.Reset();
+
+                // Attempt a fast write. Note that we could accurately determine the required bytes to encode the input here,
+                // but that requires an additional scan over the string. We could determine an upper bound here, too, but that may
+                // be wasteful. Instead, we will fall back to a slower and more accurate method if it is not.
+                var writableSpan = this.TryGetContiguous(256);
+                enc.Convert(s, writableSpan.Slice(4), true, out var charsUsed, out var bytesUsed, out var completed);
+
+                if (completed)
+                {
+                    BinaryPrimitives.WriteInt32LittleEndian(writableSpan, bytesUsed);
+                    this.currentOffset += 4 + bytesUsed;
+                    return;
+                }
+
+                // Otherwise, try again more slowly, overwriting whatever data was just copied to the output buffer.
+                this.WriteStringInternalSlower(s);
+#else
                 var bytes = Encoding.UTF8.GetBytes(s);
                 this.Write(bytes.Length);
                 this.Write(bytes);
+#endif
             }
         }
-        
+
+#if NETCOREAPP
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void WriteStringInternalSlower(string s)
+        {
+            var count = Encoding.UTF8.GetByteCount(s);
+            this.Write(count);
+            var span = this.TryGetContiguous(count);
+            if (span.Length > count)
+            {
+                Encoding.UTF8.GetBytes(s, span);
+                this.currentOffset += count;
+            }
+            else
+            {
+                var bytes = Encoding.UTF8.GetBytes(s);
+                this.WriteMultiSegment(bytes);
+            }
+        }
+#endif
+
         public void Write(char c)
         {
             this.Write(Convert.ToInt16(c));
@@ -166,21 +207,6 @@ namespace Orleans.Serialization
         {
             this.Write((byte)SerializationTokenType.Null);
         }
-
-#if SERIALIZER_SESSIONAWARE
-        private uint CheckTypeWhileSerializing(Type type)
-        {
-            if (this.referencedTypes == null) return 0;
-            this.referencedTypes.TryGetReference(type, out var result);
-            return result;
-        }
-
-        private void RecordType(Type type)
-        {
-            var types = this.referencedTypes ?? (this.referencedTypes = new ReferencedTypeCollection());
-            types.RecordTypeWhileSerializing(type);
-        }
-#endif
 
         public void WriteTypeHeader(Type t, Type expected = null)
         {
@@ -205,15 +231,7 @@ namespace Orleans.Serialization
                 this.Write((byte)token);
                 return;
             }
-#if SERIALIZER_SESSIONAWARE
-            var id = this.CheckTypeWhileSerializing(t);
-            if (id > 0)
-            {
-                this.Write((byte)SerializationTokenType.ReferencedType);
-                this.Write(id);
-                return;
-            }
-#endif
+
             if (t.GetTypeInfo().IsGenericType)
             {
                 if (typeTokens.TryGetValue(t.GetGenericTypeDefinition(), out token))
@@ -227,9 +245,6 @@ namespace Orleans.Serialization
                 }
             }
 
-#if SERIALIZER_SESSIONAWARE
-            this.RecordType(t);
-#endif
             this.Write((byte)SerializationTokenType.NamedType);
             var typeKey = t.OrleansTypeKey();
             this.Write(typeKey.Length);
@@ -338,6 +353,19 @@ namespace Orleans.Serialization
 
             void ThrowTooLarge(int l) => throw new InvalidOperationException($"Requested buffer length {l} cannot be satisfied by the writer.");
 #endif
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public Span<byte> TryGetContiguous(int length)
+        {
+            // The current buffer is adequate.
+            if (this.currentOffset + length > this.currentBuffer.Length)
+            {
+                // The current buffer is inadequate, allocate another.
+                this.Allocate(length);
+            }
+
+            return this.WritableSpan;
         }
 
         public void Allocate(int length)

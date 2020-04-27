@@ -8,7 +8,7 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Orleans.Configuration;
-using Orleans.Runtime.Messaging;
+using Orleans.Internal;
 using Orleans.Runtime.Utilities;
 
 namespace Orleans.Runtime.MembershipService
@@ -22,13 +22,14 @@ namespace Orleans.Runtime.MembershipService
         private static readonly TimeSpan EXP_BACKOFF_ERROR_MAX = TimeSpan.FromMinutes(1);
         private static readonly TimeSpan EXP_BACKOFF_CONTENTION_MAX = TimeSpan.FromMinutes(1);
         private static readonly TimeSpan EXP_BACKOFF_STEP = TimeSpan.FromMilliseconds(1000);
-        private static readonly TimeSpan ShutdownGossipTimeout = TimeSpan.FromMilliseconds(3000);
+        private static readonly TimeSpan GossipTimeout = TimeSpan.FromMilliseconds(3000);
 
         private readonly IFatalErrorHandler fatalErrorHandler;
         private readonly IMembershipGossiper gossiper;
         private readonly ILocalSiloDetails localSiloDetails;
         private readonly IMembershipTable membershipTableProvider;
         private readonly ILogger log;
+        private readonly ISiloLifecycle siloLifecycle;
         private readonly ClusterMembershipOptions clusterMembershipOptions;
         private readonly DateTime siloStartTime = DateTime.UtcNow;
         private readonly SiloAddress myAddress;
@@ -44,7 +45,8 @@ namespace Orleans.Runtime.MembershipService
             IFatalErrorHandler fatalErrorHandler,
             IMembershipGossiper gossiper,
             ILogger<MembershipTableManager> log,
-            IAsyncTimerFactory timerFactory)
+            IAsyncTimerFactory timerFactory,
+            ISiloLifecycle siloLifecycle)
         {
             this.localSiloDetails = localSiloDetails;
             this.membershipTableProvider = membershipTable;
@@ -53,13 +55,13 @@ namespace Orleans.Runtime.MembershipService
             this.clusterMembershipOptions = clusterMembershipOptions.Value;
             this.myAddress = this.localSiloDetails.SiloAddress;
             this.log = log;
-
+            this.siloLifecycle = siloLifecycle;
+            var initialEntries = ImmutableDictionary<SiloAddress, MembershipEntry>.Empty.SetItem(this.myAddress, this.CreateLocalSiloEntry(this.CurrentStatus));
             this.snapshot = new MembershipTableSnapshot(
-                    this.CreateLocalSiloEntry(this.CurrentStatus),
                     MembershipVersion.MinValue,
-                    ImmutableDictionary<SiloAddress, MembershipEntry>.Empty);
+                    initialEntries);
             this.updates = new AsyncEnumerable<MembershipTableSnapshot>(
-                (previous, proposed) => proposed.Version > previous.Version,
+                (previous, proposed) => proposed.Version == MembershipVersion.MinValue || proposed.Version > previous.Version,
                 this.snapshot)
             {
                 OnPublished = update => Interlocked.Exchange(ref this.snapshot, update)
@@ -76,24 +78,75 @@ namespace Orleans.Runtime.MembershipService
 
         public SiloStatus CurrentStatus { get; private set; } = SiloStatus.Created;
 
-        public Task Refresh() => this.RefreshInternal();
+        private bool IsStopping => this.siloLifecycle.LowestStoppedStage <= ServiceLifecycleStage.Active;
 
-        private async Task<MembershipTableData> RefreshInternal()
+        private Task pendingRefresh;
+
+        public async Task Refresh()
+        {
+            var pending = this.pendingRefresh;
+            if (pending == null || pending.IsCompleted)
+            {
+                pending = this.pendingRefresh = this.RefreshInternal(requireCleanup: false);
+            }
+
+            await pending;
+        }
+
+        public async Task RefreshFromSnapshot(MembershipTableSnapshot snapshot)
+        {
+            if (snapshot.Version == MembershipVersion.MinValue)
+                throw new ArgumentException("Cannot call RefreshFromSnapshot with Version == MembershipVersion.MinValue");
+
+            // Check if a refresh is underway
+            var pending = this.pendingRefresh;
+            if (pending != null && !pending.IsCompleted)
+            {
+                await pending;
+            }
+
+            this.log.LogInformation("Received cluster membership snapshot via gossip: {Snapshot}", snapshot);
+
+            if (snapshot.Entries.TryGetValue(this.myAddress, out var localSiloEntry))
+            {
+                if (localSiloEntry.Status == SiloStatus.Dead && this.CurrentStatus != SiloStatus.Dead)
+                {
+                    var msg = $"I should be Dead according to membership table (in RefreshFromSnapshot). Local entry: {(localSiloEntry.ToFullString(full: true))}.";
+                    this.log.Warn(ErrorCode.MembershipFoundMyselfDead1, msg);
+                    this.KillMyselfLocally(msg);
+                }
+
+                snapshot = MembershipTableSnapshot.Create(localSiloEntry.WithStatus(this.CurrentStatus), snapshot);
+            }
+            else
+            {
+                snapshot = MembershipTableSnapshot.Create(this.CreateLocalSiloEntry(this.CurrentStatus), snapshot);
+            }
+
+            // If we are behind, let's take directly the snapshot in param
+            this.updates.TryPublish(snapshot);
+        }
+
+        private async Task<bool> RefreshInternal(bool requireCleanup)
         {
             var table = await this.membershipTableProvider.ReadAll();
             this.ProcessTableUpdate(table, "Refresh");
+
+            bool success;
             try
             {
-                await CleanupMyTableEntries(table);
+                success = await this.CleanupMyTableEntries(table);
             }
-            catch (Exception exception)
+            catch (Exception exception) when (!requireCleanup)
             {
+                success = false;
                 this.log.LogWarning(
                     "Exception while trying to clean up my table entries: {Exception}",
                     exception);
             }
 
-            return table;
+            // If cleanup was not required then the cleanup result is ignored.
+            return !requireCleanup || success;
         }
 
         private async Task Start()
@@ -109,13 +162,25 @@ namespace Orleans.Runtime.MembershipService
 
                 // Init the membership table.
                 await this.membershipTableProvider.InitializeMembershipTable(true);
-                
-                var table = await this.RefreshInternal();
 
-                LogMissedIAmAlives(table);
+                // Perform an initial table read
+                var refreshed = await AsyncExecutorWithRetries.ExecuteWithRetries(
+                    function: _ => this.RefreshInternal(requireCleanup: true),
+                    maxNumSuccessTries: NUM_CONDITIONAL_WRITE_CONTENTION_ATTEMPTS,
+                    maxNumErrorTries: NUM_CONDITIONAL_WRITE_ERROR_ATTEMPTS,
+                    retryValueFilter: (value, i) => !value,
+                    retryExceptionFilter: (exc, i) => true,
+                    maxExecutionTime: this.clusterMembershipOptions.MaxJoinAttemptTime,
+                    onSuccessBackOff: new ExponentialBackoff(EXP_BACKOFF_CONTENTION_MIN, EXP_BACKOFF_CONTENTION_MAX, EXP_BACKOFF_STEP),
+                    onErrorBackOff: new ExponentialBackoff(EXP_BACKOFF_ERROR_MIN, EXP_BACKOFF_ERROR_MAX, EXP_BACKOFF_STEP));
+
+                if (!refreshed)
+                {
+                    throw new OrleansException("Failed to perform initial membership refresh and cleanup.");
+                }
 
                 // read the table and look for my node migration occurrences
-                DetectNodeMigration(table, this.localSiloDetails.DnsHostName);
+                DetectNodeMigration(this.snapshot, this.localSiloDetails.DnsHostName);
             }
             catch (Exception exception)
             {
@@ -135,12 +200,12 @@ namespace Orleans.Runtime.MembershipService
             await this.membershipTableProvider.UpdateIAmAlive(entry);
         }
 
-        private void DetectNodeMigration(MembershipTableData table, string myHostname)
+        private void DetectNodeMigration(MembershipTableSnapshot snapshot, string myHostname)
         {
             string mySiloName = this.localSiloDetails.Name;
             MembershipEntry mostRecentPreviousEntry = null;
             // look for silo instances that are same as me, find most recent with Generation before me.
-            foreach (var entry in table.Members.Select(tuple => tuple.Item1).Where(data => mySiloName.Equals(data.SiloName)))
+            foreach (var entry in snapshot.Entries.Select(entry => entry.Value).Where(data => mySiloName.Equals(data.SiloName)))
             {
                 bool iAmLater = myAddress.Generation.CompareTo(entry.SiloAddress.Generation) > 0;
                 // more recent
@@ -197,7 +262,7 @@ namespace Orleans.Runtime.MembershipService
                     }
                 }
             }
-            catch (Exception exception)
+            catch (Exception exception) when (this.fatalErrorHandler.IsUnexpected(exception))
             {
                 this.log.LogError("Error refreshing membership table: {Exception}", exception);
                 this.fatalErrorHandler.OnFatalException(this, nameof(PeriodicallyRefreshMembershipTable), exception);
@@ -209,14 +274,22 @@ namespace Orleans.Runtime.MembershipService
         }
 
         private Task<bool> MembershipExecuteWithRetries(
-            Func<int, Task<bool>> taskFunction, 
+            Func<int, Task<bool>> taskFunction,
             TimeSpan timeout)
+        {
+            return MembershipExecuteWithRetries(taskFunction, timeout, (result, i) => result == false);
+        }
+
+        private Task<T> MembershipExecuteWithRetries<T>(
+            Func<int, Task<T>> taskFunction,
+            TimeSpan timeout,
+            Func<T, int, bool> retryValueFilter)
         {
             return AsyncExecutorWithRetries.ExecuteWithRetries(
                     taskFunction,
                     NUM_CONDITIONAL_WRITE_CONTENTION_ATTEMPTS,
                     NUM_CONDITIONAL_WRITE_ERROR_ATTEMPTS,
-                    (result, i) => result == false,   // if failed to Update on contention - retry   
+                    retryValueFilter,   // if failed to Update on contention - retry   
                     (exc, i) => true,            // Retry on errors.          
                     timeout,
                     new ExponentialBackoff(EXP_BACKOFF_CONTENTION_MIN, EXP_BACKOFF_CONTENTION_MAX, EXP_BACKOFF_STEP), // how long to wait between successful retries
@@ -226,31 +299,6 @@ namespace Orleans.Runtime.MembershipService
 
         public async Task UpdateStatus(SiloStatus status)
         {
-            if (status == SiloStatus.Joining)
-            {
-                // first, cleanup all outdated entries of myself from the table
-                Func<int, Task<bool>> cleanupTableEntriesTask = async counter =>
-                {
-                    if (log.IsEnabled(LogLevel.Debug)) log.Debug("-Attempting CleanupTableEntries #{0}", counter);
-                    var table = await this.membershipTableProvider.ReadAll();
-                    log.Info(ErrorCode.MembershipReadAll_Cleanup, "-CleanupTable called on silo startup. Membership table {0}",
-                        table.ToString());
-
-                    return await CleanupMyTableEntries(table);
-                };
-
-                await MembershipExecuteWithRetries(cleanupTableEntriesTask, this.clusterMembershipOptions.MaxJoinAttemptTime);
-            }
-
-            if (status == SiloStatus.Dead && this.membershipTableProvider is SystemTargetBasedMembershipTable)
-            {
-                this.CurrentStatus = status;
-
-
-                // SystemTarget-based clustering does not support transitioning to Dead locally since at this point app scheduler turns have been stopped.
-                return;
-            }
-
             string errorString = null;
             int numCalls = 0;
             
@@ -262,20 +310,41 @@ namespace Orleans.Runtime.MembershipService
                     if (log.IsEnabled(LogLevel.Debug)) log.Debug("-Going to try to TryUpdateMyStatusGlobalOnce #{0}", counter);
                     return await TryUpdateMyStatusGlobalOnce(status);  // function to retry
                 };
+                
+                if (status == SiloStatus.Dead && this.membershipTableProvider is SystemTargetBasedMembershipTable)
+                {
+                    // SystemTarget-based membership may not be accessible at this stage, so allow for one quick attempt to update
+                    // the status before continuing regardless of the outcome.
+                    var updateTask = updateMyStatusTask(0);
+                    updateTask.Ignore();
+                    await Task.WhenAny(Task.Delay(TimeSpan.FromMilliseconds(500)), updateTask);
+
+                    var gossipTask = this.GossipToOthers(this.myAddress, status);
+                    gossipTask.Ignore();
+                    await Task.WhenAny(Task.Delay(TimeSpan.FromMilliseconds(500)), gossipTask);
+
+                    this.CurrentStatus = status;
+                    return;
+                }
 
                 bool ok = await MembershipExecuteWithRetries(updateMyStatusTask, this.clusterMembershipOptions.MaxJoinAttemptTime);
 
                 if (ok)
                 {
                     if (log.IsEnabled(LogLevel.Debug)) log.Debug("-Silo {0} Successfully updated my Status in the Membership table to {1}", myAddress, status);
+
                     var gossipTask = this.GossipToOthers(this.myAddress, status);
-                    if (status.IsTerminating())
+                    var timeoutTask = Task.Delay(GossipTimeout);
+                    var task = await Task.WhenAny(gossipTask, timeoutTask);
+                    if (ReferenceEquals(task, timeoutTask))
                     {
-                        var timeoutTask = Task.Delay(ShutdownGossipTimeout);
-                        var task = await Task.WhenAny(gossipTask, timeoutTask);
-                        if (ReferenceEquals(task, timeoutTask))
+                        if (status.IsTerminating())
                         {
-                            this.log.LogWarning("Timed out while gossiping status to other silos after {Timeout}", ShutdownGossipTimeout);
+                            this.log.LogWarning("Timed out while gossiping status to other silos after {Timeout}", GossipTimeout);
+                        }
+                        else if (this.log.IsEnabled(LogLevel.Debug))
+                        {
+                            this.log.LogDebug("Timed out while gossiping status to other silos after {Timeout}", GossipTimeout);
                         }
                     }
                 }
@@ -315,7 +384,7 @@ namespace Orleans.Runtime.MembershipService
 
             if (myEntry.Status == SiloStatus.Dead && myEntry.Status != newStatus)
             {
-                var msg = string.Format("I should be Dead according to membership table (in TryUpdateMyStatusGlobalOnce): myEntry = {0}.", myEntry.ToFullString());
+                var msg = string.Format("I should be Dead according to membership table (in TryUpdateMyStatusGlobalOnce): myEntry = {0}.", myEntry.ToFullString(full: true));
                 this.log.Warn(ErrorCode.MembershipFoundMyselfDead1, msg);
                 this.KillMyselfLocally(msg);
                 return true;
@@ -359,14 +428,12 @@ namespace Orleans.Runtime.MembershipService
                 return (myTuple.Item1.Copy(), myTuple.Item2);
             }
 
-            return (this.CreateLocalSiloEntry(currentStatus), null);
+            var result = CreateLocalSiloEntry(currentStatus);
+            return (result, null);
         }
 
-        private MembershipEntry CreateLocalSiloEntry(SiloStatus status)
+        private MembershipEntry CreateLocalSiloEntry(SiloStatus currentStatus)
         {
-            var assy = Assembly.GetEntryAssembly() ?? typeof(MembershipTableManager).Assembly;
-            var roleName = assy.GetName().Name;
-
             return new MembershipEntry
             {
                 SiloAddress = this.localSiloDetails.SiloAddress,
@@ -374,10 +441,10 @@ namespace Orleans.Runtime.MembershipService
                 HostName = this.localSiloDetails.DnsHostName,
                 SiloName = this.localSiloDetails.Name,
 
-                Status = status,
+                Status = currentStatus,
                 ProxyPort = this.localSiloDetails.GatewayAddress?.Endpoint?.Port ?? 0,
 
-                RoleName = roleName,
+                RoleName = (Assembly.GetEntryAssembly() ?? typeof(MembershipTableManager).Assembly).GetName().Name,
 
                 SuspectTimes = new List<Tuple<SiloAddress, DateTime>>(),
                 StartTime = this.siloStartTime,
@@ -400,7 +467,7 @@ namespace Orleans.Runtime.MembershipService
 
                 this.log.LogInformation(
                     (int)ErrorCode.MembershipReadAll_2,
-                    nameof(ProcessTableUpdate) + "(called from {Caller}) Membership table: {Table}",
+                    nameof(ProcessTableUpdate) + " (called from {Caller}) membership table: {Table}",
                     caller,
                     table.WithoutDuplicateDeads().ToString());
             }
@@ -428,6 +495,8 @@ namespace Orleans.Runtime.MembershipService
 
         private async Task<bool> CleanupMyTableEntries(MembershipTableData table)
         {
+            if (this.IsStopping) return true;
+
             var silosToDeclareDead = new List<Tuple<MembershipEntry, string>>();
             foreach (var tuple in table.Members.Where(
                 tuple => tuple.Item1.SiloAddress.Endpoint.Equals(myAddress.Endpoint)))
@@ -439,7 +508,7 @@ namespace Orleans.Runtime.MembershipService
                 {
                     if (entry.Status == SiloStatus.Dead)
                     {
-                        var msg = string.Format("I should be Dead according to membership table (in CleanupTableEntries): entry = {0}.", entry.ToFullString());
+                        var msg = string.Format("I should be Dead according to membership table (in CleanupTableEntries): entry = {0}.", entry.ToFullString(full: true));
                         log.Warn(ErrorCode.MembershipFoundMyselfDead2, msg);
                         KillMyselfLocally(msg);
                     }
@@ -448,7 +517,7 @@ namespace Orleans.Runtime.MembershipService
                 
                 if (entry.Status == SiloStatus.Dead)
                 {
-                    if (log.IsEnabled(LogLevel.Trace)) log.Trace("Skipping my previous old Dead entry in membership table: {0}", entry.ToFullString());
+                    if (log.IsEnabled(LogLevel.Trace)) log.Trace("Skipping my previous old Dead entry in membership table: {0}", entry.ToFullString(full: true));
                     continue;
                 }
 
@@ -512,7 +581,7 @@ namespace Orleans.Runtime.MembershipService
             foreach (var item in this.MembershipTableSnapshot.Entries)
             {
                 var entry = item.Value;
-                if (entry.SiloAddress.Equals(this.myAddress)) continue;
+                if (entry.SiloAddress.IsSameLogicalSilo(this.myAddress)) continue;
                 if (!IsFunctionalForMembership(entry.Status)) continue;
                 if (entry.HasMissedIAmAlivesSince(this.clusterMembershipOptions, now) != default) continue;
 
@@ -526,7 +595,7 @@ namespace Orleans.Runtime.MembershipService
 
             try
             {
-                await this.gossiper.GossipToRemoteSilos(updatedSilo, updatedStatus, gossipPartners);
+                await this.gossiper.GossipToRemoteSilos(gossipPartners, MembershipTableSnapshot, updatedSilo, updatedStatus);
             }
             catch (Exception exception)
             {
@@ -539,10 +608,20 @@ namespace Orleans.Runtime.MembershipService
             var table = await membershipTableProvider.ReadAll();
 
             if (log.IsEnabled(LogLevel.Debug)) log.Debug("-TryToSuspectOrKill: Read Membership table {0}", table.ToString());
+
+            if (this.IsStopping)
+            {
+                this.log.LogInformation(
+                    (int)ErrorCode.MembershipFoundMyselfDead3,
+                    "Ignoring call to TrySuspectOrKill for silo {Silo} since the local silo is dead",
+                    silo);
+                return true;
+            }
+
             var (localSiloEntry, _) = this.GetOrCreateLocalSiloEntry(table, this.CurrentStatus);
             if (localSiloEntry.Status == SiloStatus.Dead)
             {
-                var msg = string.Format("I should be Dead according to membership table (in TryToSuspectOrKill): entry = {0}.", localSiloEntry.ToFullString());
+                var msg = string.Format("I should be Dead according to membership table (in TryToSuspectOrKill): entry = {0}.", localSiloEntry.ToFullString(full: true));
                 log.Warn(ErrorCode.MembershipFoundMyselfDead3, msg);
                 KillMyselfLocally(msg);
                 return true;
@@ -682,9 +761,9 @@ namespace Orleans.Runtime.MembershipService
                 {
                     if (log.IsEnabled(LogLevel.Debug)) log.Debug("-Successfully updated {0} status to Dead in the Membership table.", entry.SiloAddress);
 
-                    GossipToOthers(entry.SiloAddress, entry.Status).Ignore();
                     var table = await membershipTableProvider.ReadAll();
                     this.ProcessTableUpdate(table, "DeclareDead");
+                    GossipToOthers(entry.SiloAddress, entry.Status).Ignore();
                     return true;
                 }
                 
@@ -698,49 +777,32 @@ namespace Orleans.Runtime.MembershipService
 
         bool IHealthCheckable.CheckHealth(DateTime lastCheckTime)
         {
-            bool ok = this.membershipUpdateTimer.CheckHealth(lastCheckTime);
+            var ok = this.membershipUpdateTimer.CheckHealth(lastCheckTime);
             return ok;
         }
 
         void ILifecycleParticipant<ISiloLifecycle>.Participate(ISiloLifecycle lifecycle)
         {
+            var tasks = new List<Task>(1);
+            lifecycle.Subscribe(
+                nameof(MembershipTableManager),
+                ServiceLifecycleStage.RuntimeGrainServices,
+                OnRuntimeGrainServicesStart,
+                OnRuntimeGrainServicesStop);
+
+            async Task OnRuntimeGrainServicesStart(CancellationToken ct)
             {
-                lifecycle.Subscribe(
-                    nameof(MembershipTableManager),
-                    ServiceLifecycleStage.RuntimeGrainServices,
-                    OnRuntimeGrainServicesStart,
-                    OnRuntimeGrainServicesStop);
-
-                async Task OnRuntimeGrainServicesStart(CancellationToken ct)
-                {
-                    await Task.Run(() => this.Start());
-                }
-
-                Task OnRuntimeGrainServicesStop(CancellationToken ct)
-                {
-                    return Task.CompletedTask;
-                }
+                await Task.Run(() => this.Start());
+                tasks.Add(Task.Run(() => this.PeriodicallyRefreshMembershipTable()));
             }
 
+            async Task OnRuntimeGrainServicesStop(CancellationToken ct)
             {
-                var tasks = new List<Task>(1);
-                lifecycle.Subscribe(
-                    nameof(MembershipTableManager),
-                    ServiceLifecycleStage.BecomeActive,
-                    OnBecomeActiveStart,
-                    OnBecomeActiveStop);
+                this.membershipUpdateTimer.Dispose();
 
-                Task OnBecomeActiveStart(CancellationToken ct)
-                {
-                    tasks.Add(Task.Run(() => this.PeriodicallyRefreshMembershipTable()));
-                    return Task.CompletedTask;
-                }
-
-                async Task OnBecomeActiveStop(CancellationToken ct)
-                {
-                    this.membershipUpdateTimer.Dispose();
-                    await Task.WhenAny(ct.WhenCancelled(), Task.WhenAll(tasks));
-                }
+                // Allow some minimum time for graceful shutdown.
+                var gracePeriod = Task.WhenAll(Task.Delay(ClusterMembershipOptions.ClusteringShutdownGracePeriod), ct.WhenCancelled());
+                await Task.WhenAny(gracePeriod, Task.WhenAll(tasks));
             }
         }
 

@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using System.Threading;
 using System.Collections.Immutable;
 using Orleans.Runtime.Utilities;
+using Orleans.Internal;
 
 namespace Orleans.Runtime.MembershipService
 {
@@ -74,28 +75,25 @@ namespace Orleans.Runtime.MembershipService
         private async Task ProcessMembershipUpdates()
         {
             ClusterMembershipSnapshot previous = default;
-            IAsyncEnumerator<MembershipTableSnapshot> enumerator = default;
             try
             {
                 if (this.log.IsEnabled(LogLevel.Debug)) this.log.LogDebug("Starting to process membership updates");
-                enumerator = this.membershipTableManager.MembershipTableUpdates.GetAsyncEnumerator(this.cancellation.Token);
-                while (await enumerator.MoveNextAsync())
+                await foreach (var tableSnapshot in this.membershipTableManager.MembershipTableUpdates.WithCancellation(this.cancellation.Token))
                 {
-                    var snapshot = enumerator.Current.CreateClusterMembershipSnapshot();
+                    var snapshot = tableSnapshot.CreateClusterMembershipSnapshot();
 
-                    var update = (previous is null) ? snapshot.AsUpdate() : snapshot.CreateUpdate(previous);
+                    var update = (previous is null || snapshot.Version == MembershipVersion.MinValue) ? snapshot.AsUpdate() : snapshot.CreateUpdate(previous);
                     this.NotifyObservers(update);
                     previous = snapshot;
                 }
             }
-            catch (Exception exception)
+            catch (Exception exception) when (this.fatalErrorHandler.IsUnexpected(exception))
             {
                 this.log.LogError("Error processing membership updates: {Exception}", exception);
                 this.fatalErrorHandler.OnFatalException(this, nameof(ProcessMembershipUpdates), exception);
             }
             finally
             {
-                if (enumerator is object) await enumerator.DisposeAsync();
                 if (this.log.IsEnabled(LogLevel.Debug)) this.log.LogDebug("Stopping membership update processor");
             }
         }
@@ -146,11 +144,12 @@ namespace Orleans.Runtime.MembershipService
         {
             var tasks = new List<Task>();
 
-            lifecycle.Subscribe(nameof(SiloStatusListenerManager), ServiceLifecycleStage.RuntimeInitialize, OnStart, OnStop);
+            lifecycle.Subscribe(nameof(SiloStatusListenerManager), ServiceLifecycleStage.AfterRuntimeGrainServices, OnStart, _ => Task.CompletedTask);
+            lifecycle.Subscribe(nameof(SiloStatusListenerManager), ServiceLifecycleStage.RuntimeInitialize, _ => Task.CompletedTask, OnStop);
 
             Task OnStart(CancellationToken ct)
             {
-                tasks.Add(this.ProcessMembershipUpdates());
+                tasks.Add(Task.Run(() => this.ProcessMembershipUpdates()));
                 return Task.CompletedTask;
             }
 

@@ -9,6 +9,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Orleans.Configuration;
+using Orleans.Internal;
 using Orleans.Runtime.Utilities;
 
 namespace Orleans.Runtime.MembershipService
@@ -16,9 +17,10 @@ namespace Orleans.Runtime.MembershipService
     /// <summary>
     /// Responsible for ensuring that this silo monitors other silos in the cluster.
     /// </summary>
-    internal class ClusterHealthMonitor : ILifecycleParticipant<ISiloLifecycle>, ClusterHealthMonitor.ITestAccessor
+    internal class ClusterHealthMonitor : IHealthCheckParticipant, ILifecycleParticipant<ISiloLifecycle>, ClusterHealthMonitor.ITestAccessor
     {
-        private readonly CancellationTokenSource cancellation = new CancellationTokenSource();
+        private readonly CancellationTokenSource shutdownCancellation = new CancellationTokenSource();
+        private readonly ILocalSiloDetails localSiloDetails;
         private readonly MembershipTableManager tableManager;
         private readonly ILogger<ClusterHealthMonitor> log;
         private readonly IFatalErrorHandler fatalErrorHandler;
@@ -36,14 +38,11 @@ namespace Orleans.Runtime.MembershipService
         {
             ImmutableDictionary<SiloAddress, SiloHealthMonitor> MonitoredSilos { get; set; }
             Func<SiloAddress, SiloHealthMonitor> CreateMonitor { get; set; }
-            ImmutableDictionary<SiloAddress, SiloHealthMonitor> UpdateMonitoredSilos(
-                MembershipTableSnapshot membership,
-                ImmutableDictionary<SiloAddress, SiloHealthMonitor> monitoredSilos,
-                DateTime now);
             MembershipVersion ObservedVersion { get; }
         }
 
         public ClusterHealthMonitor(
+            ILocalSiloDetails localSiloDetails,
             MembershipTableManager tableManager,
             ILogger<ClusterHealthMonitor> log,
             IOptions<ClusterMembershipOptions> clusterMembershipOptions,
@@ -51,6 +50,7 @@ namespace Orleans.Runtime.MembershipService
             IServiceProvider serviceProvider,
             IAsyncTimerFactory timerFactory)
         {
+            this.localSiloDetails = localSiloDetails;
             this.tableManager = tableManager;
             this.log = log;
             this.fatalErrorHandler = fatalErrorHandler;
@@ -71,6 +71,8 @@ namespace Orleans.Runtime.MembershipService
         /// <returns>A list of silos with which connectivity could not be verified.</returns>
         public async Task<List<SiloAddress>> CheckClusterConnectivity(SiloAddress[] members)
         {
+            if (members.Length == 0) return new List<SiloAddress>();
+
             var tasks = new List<Task<int>>(members.Length);
 
             this.log.LogInformation(
@@ -81,7 +83,7 @@ namespace Orleans.Runtime.MembershipService
 
             foreach (var silo in members)
             {
-                tasks.Add(this.createMonitor(silo).Probe(Interlocked.Increment(ref this.probeNumber)));
+                tasks.Add(this.createMonitor(silo).Probe(Interlocked.Increment(ref this.probeNumber), CancellationToken.None));
             }
 
             try
@@ -107,25 +109,31 @@ namespace Orleans.Runtime.MembershipService
 
         private async Task ProcessMembershipUpdates()
         {
-            IAsyncEnumerator<MembershipTableSnapshot> enumerator = default;
             try
             {
                 if (this.log.IsEnabled(LogLevel.Debug)) this.log.LogDebug("Starting to process membership updates");
-                enumerator = this.tableManager.MembershipTableUpdates.GetAsyncEnumerator(this.cancellation.Token);
-                while (await enumerator.MoveNextAsync())
+                await foreach (var tableSnapshot in this.tableManager.MembershipTableUpdates.WithCancellation(this.shutdownCancellation.Token))
                 {
-                    var current = enumerator.Current;
-                    this.monitoredSilos = this.UpdateMonitoredSilos(current, this.monitoredSilos, DateTime.UtcNow);
-                    this.observedMembershipVersion = current.Version;
+                    var newMonitoredSilos = this.UpdateMonitoredSilos(tableSnapshot, this.monitoredSilos, DateTime.UtcNow);
+
+                    foreach (var pair in this.monitoredSilos)
+                    {
+                        if (!newMonitoredSilos.ContainsKey(pair.Key))
+                        {
+                            pair.Value.Cancel();
+                        }
+                    }
+
+                    this.monitoredSilos = newMonitoredSilos;
+                    this.observedMembershipVersion = tableSnapshot.Version;
                 }
             }
-            catch (Exception exception)
+            catch (Exception exception) when (this.fatalErrorHandler.IsUnexpected(exception))
             {
                 this.fatalErrorHandler.OnFatalException(this, nameof(ProcessMembershipUpdates), exception);
             }
             finally
             {
-                if (enumerator is object) await enumerator.DisposeAsync();
                 if (this.log.IsEnabled(LogLevel.Debug)) this.log.LogDebug("Stopped processing membership updates");
             }
         }
@@ -142,10 +150,11 @@ namespace Orleans.Runtime.MembershipService
                 while (await this.monitorClusterHealthTimer.NextTick(onceOffDelay))
                 {
                     if (onceOffDelay != default) onceOffDelay = default;
+
                     _ = this.ProbeMonitoredSilos();
                 }
             }
-            catch (Exception exception)
+            catch (Exception exception) when (this.fatalErrorHandler.IsUnexpected(exception))
             {
                 this.fatalErrorHandler.OnFatalException(this, nameof(ProcessMembershipUpdates), exception);
             }
@@ -159,11 +168,12 @@ namespace Orleans.Runtime.MembershipService
         {
             try
             {
+                using var cancellation = new CancellationTokenSource(this.clusterMembershipOptions.ProbeTimeout);
                 var tasks = new List<Task>(this.monitoredSilos.Count);
                 foreach (var pair in this.monitoredSilos)
                 {
                     var monitor = pair.Value;
-                    tasks.Add(PingSilo(monitor));
+                    tasks.Add(PingSilo(monitor, cancellation.Token));
                 }
 
                 await Task.WhenAll(tasks);
@@ -176,11 +186,11 @@ namespace Orleans.Runtime.MembershipService
                     exception);
             }
 
-            async Task PingSilo(SiloHealthMonitor monitor)
+            async Task PingSilo(SiloHealthMonitor monitor, CancellationToken pingCancellation)
             {
-                var failedProbes = await monitor.Probe(Interlocked.Increment(ref this.probeNumber));
+                var failedProbes = await monitor.Probe(Interlocked.Increment(ref this.probeNumber), pingCancellation);
 
-                if (this.cancellation.IsCancellationRequested)
+                if (this.shutdownCancellation.IsCancellationRequested)
                 {
                     return;
                 }
@@ -190,17 +200,21 @@ namespace Orleans.Runtime.MembershipService
                     return;
                 }
 
-                if (!this.monitoredSilos.ContainsKey(monitor.SiloAddress))
+                if (monitor.IsCanceled || !this.monitoredSilos.ContainsKey(monitor.SiloAddress))
                 {
-                    this.log.LogInformation(
-                        (int)ErrorCode.MembershipPingedSiloNotInWatchList,
-                        "Ignoring probe failure from silo {Silo} since it is no longer being monitored.",
-                        monitor.SiloAddress,
-                        failedProbes);
+                    if (this.log.IsEnabled(LogLevel.Debug))
+                    {
+                        this.log.LogDebug(
+                            (int)ErrorCode.MembershipPingedSiloNotInWatchList,
+                            "Ignoring probe failure from silo {Silo} since it is no longer being monitored.",
+                            monitor.SiloAddress,
+                            failedProbes);
+                    }
+
                     return;
                 }
 
-                this.log.LogInformation("Silo {Silo} failed {FailedProbes} probes and is suspected of being dead. Publishing a death vote.", monitor.SiloAddress, failedProbes);
+                this.log.LogWarning("Silo {Silo} failed {FailedProbes} probes and is suspected of being dead. Publishing a death vote.", monitor.SiloAddress, failedProbes);
 
                 try
                 {
@@ -213,21 +227,14 @@ namespace Orleans.Runtime.MembershipService
             }
         }
 
-        ImmutableDictionary<SiloAddress, SiloHealthMonitor> ITestAccessor.UpdateMonitoredSilos(
-            MembershipTableSnapshot membership,
-            ImmutableDictionary<SiloAddress, SiloHealthMonitor> monitoredSilos,
-            DateTime now) => this.UpdateMonitoredSilos(membership, monitoredSilos, now);
-
         [Pure]
         private ImmutableDictionary<SiloAddress, SiloHealthMonitor> UpdateMonitoredSilos(
             MembershipTableSnapshot membership,
             ImmutableDictionary<SiloAddress, SiloHealthMonitor> monitoredSilos,
             DateTime now)
         {
-            var localSiloAddress = membership.LocalSilo.SiloAddress;
-
             // If I am still not fully functional, I should not be probing others.
-            if (!membership.Entries.TryGetValue(localSiloAddress, out var self) || !IsFunctionalForMembership(self.Status))
+            if (!membership.Entries.TryGetValue(this.localSiloDetails.SiloAddress, out var self) || !IsFunctionalForMembership(self.Status))
             {
                 return ImmutableDictionary<SiloAddress, SiloHealthMonitor>.Empty;
             }
@@ -263,6 +270,8 @@ namespace Orleans.Runtime.MembershipService
             {
                 var candidate = tmpList[(myIndex + i + 1) % tmpList.Count];
                 var candidateEntry = membership.Entries[candidate];
+
+                if (candidate.IsSameLogicalSilo(this.localSiloDetails.SiloAddress)) continue;
 
                 bool isSuspected = candidateEntry.GetFreshVotes(now, this.clusterMembershipOptions.DeathVoteExpirationTimeout).Count > 0;
                 if (isSuspected)
@@ -324,11 +333,25 @@ namespace Orleans.Runtime.MembershipService
             Task OnActiveStop(CancellationToken ct)
             {
                 this.monitorClusterHealthTimer.Dispose();
-                this.cancellation.Cancel(throwOnFirstException: false);
+                this.shutdownCancellation.Cancel(throwOnFirstException: false);
 
-                // Stop waiting for graceful shutdown when the provided cancellation token is cancelled
-                return Task.WhenAny(ct.WhenCancelled(), Task.WhenAll(tasks));
+                foreach (var monitor in this.monitoredSilos.Values)
+                {
+                    monitor.Cancel();
+                }
+
+                this.monitoredSilos = this.monitoredSilos.Clear();
+
+                // Allow some minimum time for graceful shutdown.
+                var shutdownGracePeriod = Task.WhenAll(Task.Delay(ClusterMembershipOptions.ClusteringShutdownGracePeriod), ct.WhenCancelled());
+                return Task.WhenAny(shutdownGracePeriod, Task.WhenAll(tasks));
             }
+        }
+
+        bool IHealthCheckable.CheckHealth(DateTime lastCheckTime)
+        {
+            var ok = this.monitorClusterHealthTimer.CheckHealth(lastCheckTime);
+            return ok;
         }
     }
 }

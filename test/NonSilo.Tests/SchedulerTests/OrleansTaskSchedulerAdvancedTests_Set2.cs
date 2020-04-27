@@ -7,6 +7,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Orleans;
 using Orleans.Configuration;
+using Orleans.Internal;
 using Orleans.Runtime;
 using Orleans.Runtime.Scheduler;
 using Orleans.Runtime.TestHooks;
@@ -679,7 +680,7 @@ namespace UnitTests.SchedulerTests
 
         internal async Task Run_ActivationSched_Test1(TaskScheduler scheduler, bool bounceToThreadPool)
         {
-            var grainId = GrainId.GetGrainId(0, Guid.NewGuid());
+            var grainId = LegacyGrainId.GetGrainId(0, Guid.NewGuid());
             var silo = new MockSiloDetails
             {
                 SiloAddress = SiloAddressUtils.NewLocalSiloAddress(23)

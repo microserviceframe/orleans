@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -36,7 +37,7 @@ namespace NonSilo.Tests.Membership
 
         public ClusterHealthMonitorTests(ITestOutputHelper output)
         {
-            MessagingStatisticsGroup.Init(true);
+            MessagingStatisticsGroup.Init();
             this.output = output;
             this.loggerFactory = new LoggerFactory(new[] { new XunitLoggerProvider(this.output) });
 
@@ -74,7 +75,8 @@ namespace NonSilo.Tests.Membership
                 fatalErrorHandler: this.fatalErrorHandler,
                 gossiper: this.membershipGossiper,
                 log: this.loggerFactory.CreateLogger<MembershipTableManager>(),
-                timerFactory: new AsyncTimerFactory(this.loggerFactory));
+                timerFactory: new AsyncTimerFactory(this.loggerFactory),
+                this.lifecycle);
             ((ILifecycleParticipant<ISiloLifecycle>)this.manager).Participate(this.lifecycle);
         }
 
@@ -93,6 +95,7 @@ namespace NonSilo.Tests.Membership
 
             var clusterMembershipOptions = new ClusterMembershipOptions();
             var monitor = new ClusterHealthMonitor(
+                this.localSiloDetails,
                 this.manager,
                 this.loggerFactory.CreateLogger<ClusterHealthMonitor>(),
                 Options.Create(clusterMembershipOptions),
@@ -228,10 +231,7 @@ namespace NonSilo.Tests.Membership
                 Assert.Equal(0, ((SiloHealthMonitor.ITestAccessor)siloMonitor).MissedProbes);
             }
 
-            var stopped = this.lifecycle.OnStop();
-            while (!this.timerCalls.TryDequeue(out timer)) await Task.Delay(1);
-            timer.Completion.TrySetResult(false);
-            await stopped;
+            await StopLifecycle();
         }
 
         private static SiloAddress Silo(string value) => SiloAddress.FromParsableString(value);
@@ -243,6 +243,19 @@ namespace NonSilo.Tests.Membership
             var maxTimeout = 40_000;
             while (!condition() && (maxTimeout -= 10) > 0) await Task.Delay(10);
             Assert.True(maxTimeout > 0);
+        }
+
+        private async Task StopLifecycle(CancellationToken cancellation = default)
+        {
+            var stopped = this.lifecycle.OnStop(cancellation);
+
+            while (!stopped.IsCompleted)
+            {
+                while (this.timerCalls.TryDequeue(out var call)) call.Completion.TrySetResult(false);
+                await Task.Delay(15);
+            }
+
+            await stopped;
         }
     }
 }

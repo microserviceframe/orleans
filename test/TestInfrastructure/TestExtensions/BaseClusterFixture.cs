@@ -33,7 +33,6 @@ namespace TestExtensions
 
             var builder = new TestClusterBuilder();
             TestDefaultConfiguration.ConfigureTestCluster(builder);
-            builder.ConfigureLegacyConfiguration();
             ConfigureTestCluster(builder);
 
             var testCluster = builder.Build();
@@ -78,10 +77,16 @@ namespace TestExtensions
 
         public async Task DisposeAsync()
         {
-            var cluster = this.HostedCluster;
-            if (cluster != null)
+            try
             {
-                await cluster.StopAllSilosAsync();
+                if (this.HostedCluster is TestCluster cluster)
+                {
+                    await cluster.StopAllSilosAsync();
+                }
+            }
+            finally
+            {
+                this.HostedCluster?.Dispose();
             }
         }
     }

@@ -28,9 +28,11 @@ namespace Orleans.TestingHost
     /// </remarks>
     public class TestCluster : IDisposable
     {
+        private readonly object _lockObj = new object();
         private readonly List<SiloHandle> additionalSilos = new List<SiloHandle>();
         private readonly TestClusterOptions options;
         private readonly StringBuilder log = new StringBuilder();
+        private bool _disposed;
         private int startedInstances;
 
         /// <summary>
@@ -42,7 +44,16 @@ namespace Orleans.TestingHost
         /// <summary>
         /// List of handles to the secondary silos.
         /// </summary>
-        public IReadOnlyList<SiloHandle> SecondarySilos => this.additionalSilos;
+        public IReadOnlyList<SiloHandle> SecondarySilos
+        {
+            get
+            {
+                lock (this.additionalSilos)
+                {
+                    return new List<SiloHandle>(this.additionalSilos);
+                }
+            }
+        }
 
         /// <summary>
         /// Collection of all known silos.
@@ -57,7 +68,10 @@ namespace Orleans.TestingHost
                     result.Add(this.Primary);
                 }
 
-                result.AddRange(this.additionalSilos);
+                lock (this.additionalSilos)
+                {
+                    result.AddRange(this.additionalSilos);
+                }
 
                 return result.AsReadOnly();
             }
@@ -105,14 +119,23 @@ namespace Orleans.TestingHost
         /// Delegate used to create and start an individual silo.
         /// </summary>
         public Func<string, IList<IConfigurationSource>, Task<SiloHandle>> CreateSiloAsync { private get; set; } = InProcessSiloHandle.CreateAsync;
+
+        /// <summary>
+        /// The port allocator.
+        /// </summary>
+        public ITestClusterPortAllocator PortAllocator { get; }
         
         /// <summary>
         /// Configures the test cluster plus client in-process.
         /// </summary>
-        public TestCluster(TestClusterOptions options, IReadOnlyList<IConfigurationSource> configurationSources)
+        public TestCluster(
+            TestClusterOptions options,
+            IReadOnlyList<IConfigurationSource> configurationSources,
+            ITestClusterPortAllocator portAllocator)
         {
             this.options = options;
             this.ConfigurationSources = configurationSources.ToArray();
+            this.PortAllocator = portAllocator;
         }
 
         /// <summary>
@@ -220,14 +243,22 @@ namespace Orleans.TestingHost
         /// <returns>List of current silos.</returns>
         public IEnumerable<SiloHandle> GetActiveSilos()
         {
+            var additional = new List<SiloHandle>();
+            lock (additionalSilos)
+            {
+                additional.AddRange(additionalSilos);
+            }
+
             WriteLog("GetActiveSilos: Primary={0} + {1} Additional={2}",
-                Primary, additionalSilos.Count, Runtime.Utils.EnumerableToString(additionalSilos));
+                Primary, additional.Count, Runtime.Utils.EnumerableToString(additional));
 
             if (Primary?.IsActive == true) yield return Primary;
-            if (additionalSilos.Count > 0)
-                foreach (var s in additionalSilos)
-                    if (s?.IsActive == true)
-                        yield return s;
+            
+
+            if (additional.Count > 0)
+            foreach (var s in additional)
+                if (s?.IsActive == true)
+                    yield return s;
         }
 
         /// <summary>
@@ -316,12 +347,19 @@ namespace Orleans.TestingHost
                 }
                 catch (Exception)
                 {
-                    this.additionalSilos.AddRange(siloStartTasks.Where(t => t.Exception == null).Select(t => t.Result));
+                    lock (additionalSilos)
+                    {
+                        this.additionalSilos.AddRange(siloStartTasks.Where(t => t.Exception == null).Select(t => t.Result));
+                    }
+
                     throw;
                 }
 
                 instances.AddRange(siloStartTasks.Select(t => t.Result));
-                this.additionalSilos.AddRange(instances);
+                lock (additionalSilos)
+                {
+                    this.additionalSilos.AddRange(instances);
+                }
             }
 
             return instances;
@@ -405,7 +443,10 @@ namespace Orleans.TestingHost
                 }
                 else
                 {
-                    additionalSilos.Remove(instance);
+                    lock (additionalSilos)
+                    {
+                        additionalSilos.Remove(instance);
+                    }
                 }
             }
         }
@@ -420,6 +461,17 @@ namespace Orleans.TestingHost
             {
                 // do NOT stop, just kill directly, to simulate crash.
                 await StopSiloAsync(instance, false);
+                if (Primary == instance)
+                {
+                    Primary = null;
+                }
+                else
+                {
+                    lock (additionalSilos)
+                    {
+                        additionalSilos.Remove(instance);
+                    }
+                }
             }
         }
 
@@ -454,7 +506,10 @@ namespace Orleans.TestingHost
                 }
                 else
                 {
-                    additionalSilos.Add(newInstance);
+                    lock (additionalSilos)
+                    {
+                        additionalSilos.Add(newInstance);
+                    }
                 }
 
                 return newInstance;
@@ -472,7 +527,10 @@ namespace Orleans.TestingHost
             if (siloName == null) throw new ArgumentNullException(nameof(siloName));
             var siloHandle = this.Silos.Single(s => s.Name.Equals(siloName, StringComparison.Ordinal));
             var newInstance = await this.StartSiloAsync(this.Silos.IndexOf(siloHandle), this.options);
-            additionalSilos.Add(newInstance);
+            lock (additionalSilos)
+            {
+                additionalSilos.Add(newInstance);
+            }
             return newInstance;
         }
 
@@ -542,13 +600,13 @@ namespace Orleans.TestingHost
 
             // Add overrides.
             if (configurationOverrides != null) configurationSources.AddRange(configurationOverrides);
-            var siloSpecificOptions = TestSiloSpecificOptions.Create(clusterOptions, instanceNumber, startSiloOnNewPort);
+            var siloSpecificOptions = TestSiloSpecificOptions.Create(this, clusterOptions, instanceNumber, startSiloOnNewPort);
             configurationSources.Add(new MemoryConfigurationSource
             {
                 InitialData = siloSpecificOptions.ToDictionary()
             });
 
-            var handle = await this.CreateSiloAsync(siloSpecificOptions.SiloName,configurationSources);
+            var handle = await this.CreateSiloAsync(siloSpecificOptions.SiloName, configurationSources);
             handle.InstanceNumber = (short)instanceNumber;
             Interlocked.Increment(ref this.startedInstances);
             return handle;
@@ -590,13 +648,33 @@ namespace Orleans.TestingHost
 
         public void Dispose()
         {
-            foreach (var handle in this.SecondarySilos)
+            if (_disposed)
             {
-                handle.Dispose();
+                return;
             }
 
-            this.Primary?.Dispose();
-            this.Client?.Dispose();
+            lock (_lockObj)
+            {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                foreach (var handle in this.SecondarySilos)
+                {
+                    handle.Dispose();
+                }
+
+                this.Primary?.Dispose();
+                this.Client?.Dispose();
+
+                if (this.PortAllocator is object)
+                {
+                    this.PortAllocator.Dispose();
+                }
+
+                _disposed = true;
+            }
         }
     }
 }

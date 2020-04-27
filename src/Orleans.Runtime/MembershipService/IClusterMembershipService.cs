@@ -1,12 +1,14 @@
 using System.Collections.Generic;
-using Orleans.Runtime.Utilities;
+using System.Threading.Tasks;
 
 namespace Orleans.Runtime
 {
-    internal interface IClusterMembershipService
+    public interface IClusterMembershipService
     {
         ClusterMembershipSnapshot CurrentSnapshot { get; }
 
         IAsyncEnumerable<ClusterMembershipSnapshot> MembershipUpdates { get; }
+
+        ValueTask Refresh(MembershipVersion minimumVersion = default);
     }
 }

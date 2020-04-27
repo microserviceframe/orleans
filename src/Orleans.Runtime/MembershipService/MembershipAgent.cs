@@ -6,13 +6,14 @@ using System.Threading.Tasks;
 using System.Threading;
 using Microsoft.Extensions.Options;
 using System.Linq;
+using Orleans.Internal;
 
 namespace Orleans.Runtime.MembershipService
 {
     /// <summary>
     /// Responsible for updating membership table with details about the local silo.
     /// </summary>
-    internal class MembershipAgent : ILifecycleParticipant<ISiloLifecycle>, IDisposable, MembershipAgent.ITestAccessor
+    internal class MembershipAgent : IHealthCheckParticipant, ILifecycleParticipant<ISiloLifecycle>, IDisposable, MembershipAgent.ITestAccessor
     {
         private readonly CancellationTokenSource cancellation = new CancellationTokenSource();
         private readonly MembershipTableManager tableManager;
@@ -22,7 +23,7 @@ namespace Orleans.Runtime.MembershipService
         private readonly ClusterMembershipOptions clusterMembershipOptions;
         private readonly ILogger<MembershipAgent> log;
         private readonly IAsyncTimer iAmAliveTimer;
-
+        private Func<DateTime> getUtcDateTime = () => DateTime.UtcNow;
 
         public MembershipAgent(
             MembershipTableManager tableManager,
@@ -47,9 +48,11 @@ namespace Orleans.Runtime.MembershipService
         internal interface ITestAccessor
         {
             Action OnUpdateIAmAlive { get; set; }
+            Func<DateTime> GetDateTime { get; set; }
         }
 
         Action ITestAccessor.OnUpdateIAmAlive { get; set; }
+        Func<DateTime> ITestAccessor.GetDateTime { get => this.getUtcDateTime; set => this.getUtcDateTime = value ?? throw new ArgumentNullException(nameof(value)); }
 
         private async Task UpdateIAmAlive()
         {
@@ -57,7 +60,7 @@ namespace Orleans.Runtime.MembershipService
             try
             {
                 TimeSpan? onceOffDelay = default;
-                while (!this.tableManager.CurrentStatus.IsTerminating() && await this.iAmAliveTimer.NextTick(onceOffDelay))
+                while (await this.iAmAliveTimer.NextTick(onceOffDelay) && !this.tableManager.CurrentStatus.IsTerminating())
                 {
                     onceOffDelay = default;
 
@@ -80,7 +83,7 @@ namespace Orleans.Runtime.MembershipService
                     }
                 }
             }
-            catch (Exception exception)
+            catch (Exception exception) when (this.fatalErrorHandler.IsUnexpected(exception))
             {
                 this.log.LogError("Error updating liveness timestamp: {Exception}", exception);
                 this.fatalErrorHandler.OnFatalException(this, nameof(UpdateIAmAlive), exception);
@@ -127,88 +130,118 @@ namespace Orleans.Runtime.MembershipService
 
         private async Task ValidateInitialConnectivity()
         {
-            var activeSilos = new List<SiloAddress>();
-            var now = DateTime.UtcNow;
-            foreach (var item in this.tableManager.MembershipTableSnapshot.Entries)
+            // Continue attempting to validate connectivity until some reasonable timeout.
+            var maxAttemptTime = this.clusterMembershipOptions.ProbeTimeout.Multiply(5.0 * this.clusterMembershipOptions.NumMissedProbesLimit);
+            var attemptNumber = 1;
+            var now = this.getUtcDateTime();
+            var attemptUntil = now + maxAttemptTime;
+            var canContinue = true;
+
+            while (true)
             {
-                var entry = item.Value;
-                if (entry.Status != SiloStatus.Active) continue;
-                if (entry.SiloAddress.Endpoint.Equals(this.localSilo.SiloAddress.Endpoint)) continue;
-                if (entry.HasMissedIAmAlivesSince(this.clusterMembershipOptions, now) != default) continue;
+                try
+                {
+                    var activeSilos = new List<SiloAddress>();
+                    foreach (var item in this.tableManager.MembershipTableSnapshot.Entries)
+                    {
+                        var entry = item.Value;
+                        if (entry.Status != SiloStatus.Active) continue;
+                        if (entry.SiloAddress.IsSameLogicalSilo(this.localSilo.SiloAddress)) continue;
+                        if (entry.HasMissedIAmAlivesSince(this.clusterMembershipOptions, now) != default) continue;
 
-                activeSilos.Add(entry.SiloAddress);
-            }
+                        activeSilos.Add(entry.SiloAddress);
+                    }
 
-            var failedSilos = await this.clusterHealthMonitor.CheckClusterConnectivity(activeSilos.ToArray());
-            var successfulSilos = activeSilos.Where(s => !failedSilos.Contains(s));
+                    var failedSilos = await this.clusterHealthMonitor.CheckClusterConnectivity(activeSilos.ToArray());
+                    var successfulSilos = activeSilos.Where(s => !failedSilos.Contains(s)).ToList();
 
-            if (failedSilos.Count > 0)
-            {
-                this.log.LogError(
-                    (int)ErrorCode.MembershipJoiningPreconditionFailure,
-                    "Failed to get ping responses from {FailedCount} of {ActiveCount} active silos. "
-                    + "Newly joining silos validate connectivity with all active silos that have recently updated their 'I Am Alive' value before joining the cluster."
-                    + "Successfully contacted: {SuccessfulSilos}. Silos which did not respond successfully are: {FailedSilos}",
-                    failedSilos.Count,
-                    activeSilos.Count,
-                    Utils.EnumerableToString(successfulSilos),
-                    Utils.EnumerableToString(failedSilos));
+                    // If there were no failures, terminate the loop and return without error.
+                    if (failedSilos.Count == 0) break;
 
-                var msg = $"Failed to get ping responses from {failedSilos.Count} of {activeSilos.Count} active silos. "
-                    + "Newly joining silos validate connectivity with all active silos that have recently updated their 'I Am Alive' value before joining the cluster."
-                    + $"Successfully contacted: {Utils.EnumerableToString(successfulSilos)}. Failed to get response from: {Utils.EnumerableToString(failedSilos)}";
-                throw new OrleansClusterConnectivityCheckFailedException(msg);
+                    this.log.LogError(
+                        (int)ErrorCode.MembershipJoiningPreconditionFailure,
+                        "Failed to get ping responses from {FailedCount} of {ActiveCount} active silos. "
+                        + "Newly joining silos validate connectivity with all active silos that have recently updated their 'I Am Alive' value before joining the cluster. "
+                        + "Successfully contacted: {SuccessfulSilos}. Silos which did not respond successfully are: {FailedSilos}. "
+                        + "Will continue attempting to validate connectivity until {Timeout}. Attempt #{Attempt}",
+                        failedSilos.Count,
+                        activeSilos.Count,
+                        Utils.EnumerableToString(successfulSilos),
+                        Utils.EnumerableToString(failedSilos),
+                        attemptUntil,
+                        attemptNumber);
+
+                    if (now + TimeSpan.FromSeconds(5) > attemptUntil)
+                    {
+                        canContinue = false;
+                        var msg = $"Failed to get ping responses from {failedSilos.Count} of {activeSilos.Count} active silos. "
+                            + "Newly joining silos validate connectivity with all active silos that have recently updated their 'I Am Alive' value before joining the cluster. "
+                            + $"Successfully contacted: {Utils.EnumerableToString(successfulSilos)}. Failed to get response from: {Utils.EnumerableToString(failedSilos)}";
+                        throw new OrleansClusterConnectivityCheckFailedException(msg);
+                    }
+
+                    // Refresh membership after some delay and retry.
+                    await Task.Delay(TimeSpan.FromSeconds(5));
+                    await this.tableManager.Refresh();
+                }
+                catch (Exception exception) when (canContinue)
+                {
+                    this.log.LogError("Failed to validate initial cluster connectivity: {Exception}", exception);
+                    await Task.Delay(TimeSpan.FromSeconds(1));
+                }
+
+                ++attemptNumber;
+                now = this.getUtcDateTime();
             }
         }
 
-        private async Task StartJoining()
+        private async Task BecomeJoining()
         {
-            this.log.Info(ErrorCode.MembershipShutDown, "-" + "Shutdown");
+            this.log.Info(ErrorCode.MembershipJoining, "-Joining");
             try
             {
                 await this.UpdateStatus(SiloStatus.Joining);
             }
             catch (Exception exc)
             {
-                this.log.Error(ErrorCode.MembershipFailedToShutdown, "Error doing Shutdown", exc);
+                this.log.Error(ErrorCode.MembershipFailedToJoin, "Error updating status to Joining", exc);
                 throw;
             }
         }
 
-        private async Task Shutdown()
+        private async Task BecomeShuttingDown()
         {
-            this.log.Info(ErrorCode.MembershipShutDown, "-" + "Shutdown");
+            this.log.Info(ErrorCode.MembershipShutDown, "-Shutdown");
             try
             {
                 await this.UpdateStatus(SiloStatus.ShuttingDown);
             }
             catch (Exception exc)
             {
-                this.log.Error(ErrorCode.MembershipFailedToShutdown, "Error doing Shutdown", exc);
+                this.log.Error(ErrorCode.MembershipFailedToShutdown, "Error updating status to ShuttingDown", exc);
                 throw;
             }
         }
 
-        private async Task Stop()
+        private async Task BecomeStopping()
         {
-            const string operation = "Stop";
-            log.Info(ErrorCode.MembershipStop, "-" + operation);
+            log.Info(ErrorCode.MembershipStop, "-Stop");
             try
             {
                 await this.UpdateStatus(SiloStatus.Stopping);
             }
             catch (Exception exc)
             {
-                log.Error(ErrorCode.MembershipFailedToStop, "Error doing " + operation, exc);
+                log.Error(ErrorCode.MembershipFailedToStop, "Error updating status to Stopping", exc);
                 throw;
             }
         }
 
-        private async Task KillMyself()
+        private async Task BecomeDead()
         {
             this.log.LogInformation(
                 (int)ErrorCode.MembershipKillMyself,
-                "Updating status to " + nameof(SiloStatus.Dead));
+                "Updating status to Dead");
 
             try
             {
@@ -232,23 +265,20 @@ namespace Orleans.Runtime.MembershipService
         void ILifecycleParticipant<ISiloLifecycle>.Participate(ISiloLifecycle lifecycle)
         {
             {
-                Task OnRuntimeInitializeStart(CancellationToken ct)
-                {
-                    return Task.CompletedTask;
-                }
+                Task OnRuntimeInitializeStart(CancellationToken ct) => Task.CompletedTask;
 
                 async Task OnRuntimeInitializeStop(CancellationToken ct)
                 {
                     this.iAmAliveTimer.Dispose();
                     this.cancellation.Cancel();
                     await Task.WhenAny(
-                        Task.Run(() => this.KillMyself()),
+                        Task.Run(() => this.BecomeDead()),
                         Task.Delay(TimeSpan.FromMinutes(1)));
                 }
 
                 lifecycle.Subscribe(
                     nameof(MembershipAgent),
-                    ServiceLifecycleStage.RuntimeInitialize,
+                    ServiceLifecycleStage.RuntimeInitialize + 1, // Gossip before the outbound queue gets closed
                     OnRuntimeInitializeStart,
                     OnRuntimeInitializeStop);
             }
@@ -256,7 +286,7 @@ namespace Orleans.Runtime.MembershipService
             {
                 async Task AfterRuntimeGrainServicesStart(CancellationToken ct)
                 {
-                    await Task.Run(() => this.StartJoining());
+                    await Task.Run(() => this.BecomeJoining());
                 }
 
                 Task AfterRuntimeGrainServicesStop(CancellationToken ct) => Task.CompletedTask;
@@ -285,19 +315,21 @@ namespace Orleans.Runtime.MembershipService
 
                     if (ct.IsCancellationRequested)
                     {
-                        await Task.Run(() => this.Stop());
+                        await Task.Run(() => this.BecomeStopping());
                     }
                     else
                     {
-                        var task = await Task.WhenAny(cancellationTask, this.Shutdown());
-                        if (ReferenceEquals(task, cancellationTask))
+                        // Allow some minimum time for graceful shutdown.
+                        var gracePeriod = Task.WhenAll(Task.Delay(ClusterMembershipOptions.ClusteringShutdownGracePeriod), cancellationTask);
+                        var task = await Task.WhenAny(gracePeriod, this.BecomeShuttingDown());
+                        if (ReferenceEquals(task, gracePeriod))
                         {
                             this.log.LogWarning("Graceful shutdown aborted: starting ungraceful shutdown");
-                            await Task.Run(() => this.Stop());
+                            await Task.Run(() => this.BecomeStopping());
                         }
                         else
                         {
-                            await Task.WhenAny(cancellationTask, Task.WhenAll(tasks));
+                            await Task.WhenAny(gracePeriod, Task.WhenAll(tasks));
                         }
                     }
                 }
@@ -313,6 +345,12 @@ namespace Orleans.Runtime.MembershipService
         public void Dispose()
         {
             this.iAmAliveTimer.Dispose();
+        }
+
+        bool IHealthCheckable.CheckHealth(DateTime lastCheckTime)
+        {
+            var ok = this.iAmAliveTimer.CheckHealth(lastCheckTime);
+            return ok;
         }
     }
 }

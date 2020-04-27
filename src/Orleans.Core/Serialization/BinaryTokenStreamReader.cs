@@ -5,7 +5,6 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
-using System.Resources;
 using System.Runtime.CompilerServices;
 using System.Runtime.Serialization;
 using System.Text;
@@ -17,12 +16,21 @@ namespace Orleans.Serialization
 {
     internal static class BinaryTokenStreamReaderExtensinons
     {
+        internal static IdSpan ReadIdSpan<TReader>(this TReader @this) where TReader : IBinaryTokenStreamReader
+        {
+            var hashCode = @this.ReadInt();
+            var len = @this.ReadUShort();
+            var bytes = @this.ReadBytes(len);
+            return IdSpan.UnsafeCreate(bytes, hashCode);
+        }
+
         /// <summary> Read an <c>GrainId</c> value from the stream. </summary>
         /// <returns>Data from current position in stream, converted to the appropriate output type.</returns>
         internal static GrainId ReadGrainId<TReader>(this TReader @this) where TReader : IBinaryTokenStreamReader
         {
-            UniqueKey key = @this.ReadUniqueKey();
-            return GrainId.GetGrainId(key);
+            var type = @this.ReadIdSpan();
+            var key = @this.ReadIdSpan();
+            return new GrainId(new GrainType(type), key);
         }
 
         /// <summary> Read an <c>ActivationId</c> value from the stream. </summary>
@@ -65,7 +73,7 @@ namespace Orleans.Serialization
                 silo = null;
 
             if (act.Equals(ActivationId.Zero))
-                act = null;
+                act = default;
 
             return ActivationAddress.GetAddress(silo, grain, act);
         }
@@ -89,7 +97,6 @@ namespace Orleans.Serialization
         internal static bool TryReadSimpleType<TReader>(this TReader @this, out object result, out SerializationTokenType token) where TReader : IBinaryTokenStreamReader
         {
             token = @this.ReadToken();
-            byte[] bytes;
             switch (token)
             {
                 case SerializationTokenType.True:
@@ -144,8 +151,16 @@ namespace Orleans.Serialization
                     result = @this.ReadChar();
                     break;
                 case SerializationTokenType.Guid:
-                    bytes = @this.ReadBytes(16);
-                    result = new Guid(bytes);
+                    if (@this is BinaryTokenStreamReader2 reader)
+                    {
+                        result = reader.ReadGuid();
+                    }
+                    else
+                    {
+                        var bytes = @this.ReadBytes(16);
+                        result = new Guid(bytes);
+                    }
+
                     break;
                 case SerializationTokenType.Date:
                     result = DateTime.FromBinary(@this.ReadLong());
@@ -416,7 +431,8 @@ namespace Orleans.Serialization
                     var typeName = @this.ReadString();
                     try
                     {
-                        return serializationManager.ResolveTypeName(typeName);
+                        var type = serializationManager.ResolveTypeName(typeName);
+                        return type;
                     }
                     catch (TypeAccessException ex)
                     {
@@ -551,7 +567,7 @@ namespace Orleans.Serialization
         /// <summary>
         /// Gets the total length.
         /// </summary>
-        public int Length => this.totalLength;
+        public long Length => this.totalLength;
 
         /// <summary>
         /// Creates a copy of the current stream reader.
